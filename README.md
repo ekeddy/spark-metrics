@@ -11,3 +11,4 @@ For further information how we use this extension and the Prometheus sink at [Ba
 * [Application monitoring with Prometheus and Pipeline](https://banzaicloud.com/blog/prometheus-application-monitoring/)<br/>
 
 
+To update the maven repo,  run 'sbt publish'

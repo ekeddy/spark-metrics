@@ -23,8 +23,7 @@ import java.util.concurrent.TimeUnit
 
 import com.banzaicloud.metrics.prometheus.client.exporter.PushGatewayWithTimestamp
 import com.codahale.metrics._
-import io.prometheus.client.CollectorRegistry
-import io.prometheus.client.dropwizard.DropwizardExports
+import io.prometheus.client.{Collector, CollectorRegistry}
 import org.apache.spark.internal.Logging
 import org.apache.spark.metrics.sink.Sink
 import org.apache.spark.{SecurityManager, SparkConf, SparkEnv}
@@ -39,6 +38,43 @@ class PrometheusSink(
                       securityMgr: SecurityManager)
   extends Sink with Logging {
 
+  protected class PrometheusJobConfig {
+    val defaultSparkConf: SparkConf = new SparkConf(true)
+    logInfo("Initializing JobConfig")
+
+    // SparkEnv may become available only after metrics sink creation thus retrieving
+    // SparkConf from spark env here and not during the creation/initialisation of PrometheusSink.
+    val sparkConf: SparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(defaultSparkConf)
+
+    val metricsNamespace: Option[String] = sparkConf.getOption("spark.metrics.namespace")
+    val sparkAppId: String = sparkConf.getOption("spark.app.id").get
+    val sparkAppName: String = sparkConf.getOption("spark.app.name").getOrElse("")
+    val executorId: Option[String] = sparkConf.getOption("spark.executor.id")
+
+    val role = executorId match {
+      case Some("driver") | Some("<driver>") => "driver"
+      case Some(_) => "executor"
+      case _ => "shuffle"
+    }
+
+    val job = role match {
+      case "driver" => metricsNamespace.getOrElse(sparkAppId)
+      case "executor" => metricsNamespace.getOrElse(sparkAppId)
+      case _ => metricsNamespace.getOrElse("shuffle")
+    }
+
+    val groupingKey = {
+      (role, executorId) match {
+        case ("driver", _) => Map("role" -> role)
+        case ("executor", Some(id)) => Map("role" -> role, "number" -> id)
+        case _ => Map("role" -> role)
+      }
+    }.asJava
+
+    logInfo(s"metricsNamespace=$metricsNamespace, sparkAppId=$sparkAppId, " +
+      s"sparkAppName=$sparkAppName, role=$role, executorId=$executorId")
+  }
+
   protected class Reporter(registry: MetricRegistry)
     extends ScheduledReporter(
       registry,
@@ -47,7 +83,8 @@ class PrometheusSink(
       TimeUnit.SECONDS,
       TimeUnit.MILLISECONDS) {
 
-    val defaultSparkConf: SparkConf = new SparkConf(true)
+    lazy val conf = new PrometheusJobConfig
+    lazy val sparkMetricExports: Collector = new SparkMetricExports(conf.metricsNamespace.getOrElse(conf.sparkAppId),conf.sparkAppName,registry)
 
     override def report(
                          gauges: util.SortedMap[String, Gauge[_]],
@@ -55,40 +92,11 @@ class PrometheusSink(
                          histograms: util.SortedMap[String, Histogram],
                          meters: util.SortedMap[String, Meter],
                          timers: util.SortedMap[String, Timer]): Unit = {
-
-      // SparkEnv may become available only after metrics sink creation thus retrieving
-      // SparkConf from spark env here and not during the creation/initialisation of PrometheusSink.
-      val sparkConf: SparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(defaultSparkConf)
-
-      val metricsNamespace: Option[String] = sparkConf.getOption("spark.metrics.namespace")
-      val sparkAppId: Option[String] = sparkConf.getOption("spark.app.id")
-      val executorId: Option[String] = sparkConf.getOption("spark.executor.id")
-
-      logInfo(s"metricsNamespace=$metricsNamespace, sparkAppId=$sparkAppId, " +
-        s"executorId=$executorId")
-
-      val role: String = (sparkAppId, executorId) match {
-        case (Some(_), Some("driver")) | (Some(_), Some("<driver>"))=> "driver"
-        case (Some(_), Some(_)) => "executor"
-        case _ => "shuffle"
-      }
-
-      val job: String = role match {
-        case "driver" => metricsNamespace.getOrElse(sparkAppId.get)
-        case "executor" => metricsNamespace.getOrElse(sparkAppId.get)
-        case _ => metricsNamespace.getOrElse("shuffle")
-      }
-      logInfo(s"role=$role, job=$job")
-
-      val groupingKey: Map[String, String] = (role, executorId) match {
-        case ("driver", _) => Map("role" -> role)
-        case ("executor", Some(id)) => Map ("role" -> role, "number" -> id)
-        case _ => Map("role" -> role)
-      }
+      logInfo("Reporting Metrics")
 
       val metricTimestamp = if (enableTimestamp) Some(s"${System.currentTimeMillis}") else None
 
-      pushGateway.pushAdd(pushRegistry, job, groupingKey.asJava, metricTimestamp.orNull)
+      pushGateway.pushAdd(sparkMetricExports, conf.job, conf.groupingKey, metricTimestamp.orNull)
     }
   }
 
@@ -140,20 +148,18 @@ class PrometheusSink(
   logInfo(s"$KEY_PUSHGATEWAY_ADDRESS_PROTOCOL -> $pushGatewayAddressProtocol")
 
   val pushRegistry: CollectorRegistry = new CollectorRegistry()
-  val sparkMetricExports: DropwizardExports = new DropwizardExports(registry)
   val pushGateway: PushGatewayWithTimestamp =
     new PushGatewayWithTimestamp(s"$pushGatewayAddressProtocol://$pushGatewayAddress")
 
   val reporter = new Reporter(registry)
 
   override def start(): Unit = {
-    sparkMetricExports.register(pushRegistry)
     reporter.start(pollPeriod, pollUnit)
   }
 
   override def stop(): Unit = {
     reporter.stop()
-    pushRegistry.unregister(sparkMetricExports)
+    pushRegistry.clear()
   }
 
   override def report(): Unit = {

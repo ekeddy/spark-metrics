@@ -186,6 +186,21 @@ public class PushGatewayWithTimestamp {
         pushAdd(registry, job, groupingKey, null);
     }
 
+    /**
+     * Pushes all metrics in a Collector,
+     * replacing only previously pushed metrics of the same name, job and grouping key.
+     * <p>
+     * This is useful for pushing a single Gauge.
+     * <p>
+     * This uses the POST HTTP method.
+     */
+    public void pushAdd(Collector collector, String job,
+                        Map<String, String> groupingKey, String timestamp) throws IOException {
+        CollectorRegistry registry = new CollectorRegistry();
+        collector.register(registry);
+        pushAdd(registry, job, groupingKey, timestamp);
+    }
+
 
     /**
      * Deletes metrics from the Pushgateway.
